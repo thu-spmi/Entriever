@@ -7,6 +7,11 @@ First, install all the requirements:
 pip install -r requirements.txt 
 ```
 
+Then, unzip the data files:
+```Shell
+unzip data.zip
+unzip data_e2e.zip
+```
 ## Data Description
 The data for the MobileCS dataset is under the directory of data/seretod.
 The data for the other 3 datasets is under the directory of data_e2e.
