@@ -57,3 +57,7 @@ cfg.train_ebm = False
 cfg.train_retrieve = False
 test_retrieve = False
 ```
+
+### Using Entriever in semi-supervised dialog systems
+Building a semi-supervised dialog system is complicated, we employ our entriever upon the origin JSA-KRTOD code (https://github.com/thu-spmi/JSA-KRTOD/).
+To run the JSA-KRTOD system with entriever, you need to substitute main.py for JSA-KRTOD with the main.py in this repo.
