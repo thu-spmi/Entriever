@@ -4,16 +4,16 @@ from transformers import BertModel, BertForPreTraining, BertForNextSentencePredi
 from transformers import BertTokenizer
 from reader import *
 from metrics import *
+from model import *
+from evaluate import *
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Dropout, CrossEntropyLoss, CosineEmbeddingLoss, CosineSimilarity
 from torch.utils.data import DataLoader
 
-import os, shutil
+import os
 import random
-import argparse
-import time
 import logging
 import json
 from tqdm import tqdm
@@ -21,113 +21,6 @@ import numpy as np
 import copy, re
 from torch.utils.tensorboard import SummaryWriter
 from config import global_config as cfg
-
-class EBM(torch.nn.Module):
-    def __init__(self, cfg, tokenizer, en=False):
-        super(EBM, self).__init__()
-        self.cfg = cfg
-        if en:
-            self.bert_model=BertModel.from_pretrained('bert-base')
-        else:
-            self.bert_model=BertModel.from_pretrained('ret_exp/best_bert')
-        #cfg.model_path
-        # cannot connect to bert-base-chinese,use
-        self.bert_model.resize_token_embeddings(len(tokenizer))
-        self.dropout = Dropout(cfg.dropout)
-        self.classifier = nn.Linear(self.bert_model.config.hidden_size, 1) # we need to get an energy function, returning the logit
-        if cfg.add_extra_feature:
-            self.reg_weight = nn.Linear(1, 1) # cfg.reg_weight
-
-    def forward(self,input_ids: torch.tensor,
-                attention_mask: torch.tensor, feature=None):
-        hidden_states = self.bert_model(input_ids=input_ids,attention_mask = attention_mask)[0] # B*L*h
-        #pooled_output =  (hidden_states[:, :, :]*attention_mask.unsqueeze(-1)).mean(dim=1)
-        # attention_mask.sum(dim=1)
-        # a more reasonable energy definition which avoids different energy scale in different condition
-        pooled_output =  (hidden_states[:, :, :]*attention_mask.unsqueeze(-1)).sum(dim=1)/attention_mask.sum(dim=1).unsqueeze(-1)
-        logits = self.classifier(self.dropout(pooled_output))
-        if feature is not None:
-            logits = logits + self.reg_weight(feature.unsqueeze(-1))
-            #for i in range(len(logits)):
-            #    logits[i][0] = logits[i][0] + self.reg_weight(feature[i]) 
-        #logits = self.classifier(pooled_output)
-        return logits
-
-class Bert_Model(torch.nn.Module): # not used, do not copy
-    def __init__(self, cfg, tokenizer):
-        super(Bert_Model, self).__init__()
-        self.cfg = cfg
-        self.bert_model=BertForPreTraining.from_pretrained('bert-base-chinese')#cfg.model_path
-        self.bert_model.resize_token_embeddings(len(tokenizer))
-        #self.dropout = Dropout(cfg.dropout)
-        #self.classifier = nn.Linear(self.bert_model.config.hidden_size, self.bert_model.config.hidden_size) 
-        #self.num_labels = cfg.num_domains
-
-    def forward(self,input_ids: torch.tensor,
-                attention_mask: torch.tensor,
-                label: torch.tensor = None):
-        hidden_states = self.bert_model(input_ids=input_ids,attention_mask = attention_mask)[0]
-        pooled_output =  hidden_states[:, :]*attention_mask.unsqueeze(-1).mean(dim=1)
-        logits = self.classifier(self.dropout(pooled_output))
-        loss_fct = CrossEntropyLoss()
-        loss = loss_fct(logits.view(-1, self.num_labels), label.type(torch.long))
-        return logits, loss
-
-class EncoderModel(torch.nn.Module):
-    def __init__(self, cfg, tokenizer):
-        super(EncoderModel, self).__init__()
-        self.sentence_model=BertModel.from_pretrained('bert-base-chinese')
-        self.triple_model=BertModel.from_pretrained('bert-base-chinese')
-        self.inner_product = nn.Bilinear(self.sentence_model.config.hidden_size, self.triple_model.config.hidden_size, 1) # 768
-        self.sentence_model.resize_token_embeddings(len(tokenizer))
-        self.triple_model.resize_token_embeddings(len(tokenizer))
-        if isinstance(cfg.device,list):
-            self.device = cfg.device[0]
-            self.device1 = cfg.device[-1]
-        else:
-            self.device = cfg.device
-            self.device1 = cfg.device
-        
-        self.sentence_model.to(self.device)
-        self.inner_product.to(self.device)
-        self.triple_model.to(self.device1)
-
-        if 'train' in cfg.mode:
-            json.dump(cfg.__dict__,open(os.path.join(cfg.exp_path,'cfg_all.json'),'w'),indent=2)        
-        # log
-        log_path='./log/log_retrieve/log_{}'.format(cfg.exp_name)
-        if os.path.exists(log_path):
-            shutil.rmtree(log_path)
-            os.mkdir(log_path)
-        else:
-            os.mkdir(log_path)
-        self.tb_writer = SummaryWriter(log_dir=log_path)
-
-    def forward(self,input_sent: torch.tensor,
-                attention_sent: torch.tensor,
-                input_triple,
-                attention_triple,
-                label):
-        THRESHOLD = 0.5
-        hidden_states = self.sentence_model(input_ids=input_sent,attention_mask = attention_sent)[0]
-        h_sent =  hidden_states[:, :].mean(dim=1) # [cls] is also ok
-        hidden = self.sentence_model(input_ids=input_triple,attention_mask = attention_triple)[0] # to triple's device
-        h_triple =  hidden[:, :].mean(dim=1) # [cls] is also ok
-        # cos_sim = CosineSimilarity(dim=1)
-        # sim = cos_sim(h_sent, h_triple) # sim for score
-        # cos_loss = CosineEmbeddingLoss() # margin = cfg.margin
-        # loss = cos_loss(h_sent, h_triple, label) # can try Bilinear discriminator and celoss
-        logits = self.inner_product(h_sent, h_triple) # need to be on the same device
-        # loss_fct = nn.CrossEntropyLoss(reduction='sum') # 
-        loss_fct = nn.BCELoss(reduction='sum')
-        probs = torch.sigmoid(logits)
-        # loss = nn.BCEWithLogitsLoss(logits, label.unsqueeze(-1).float())
-        loss = loss_fct(probs, label.unsqueeze(-1).float())
-        predictions = (probs<(1-THRESHOLD)).squeeze()
-        labels = (label==0)
-        accuracy = (predictions == labels).sum() / label.shape[0]
-        
-        return loss, accuracy.item(), predictions.cpu().tolist(), labels.cpu().tolist()
 
 def get_optimizers(num_samples, model, lr): # , cfg
     optimizer_grouped_parameters = [
@@ -198,6 +91,7 @@ def collate_fn(batch):
             pad_result['label'] = torch.from_numpy(pad_batch).long()
     return pad_result
 
+# training code for baseline retrievers
 def train(cfg, dataset='seretod'):
     cfg.exp_path = 'experiments_retrieve'
     cfg.batch_size = 16 # 32
@@ -298,6 +192,7 @@ def train(cfg, dataset='seretod'):
     #print(score)
     return
 
+# training code for Entriever
 def train_ebm(cfg, dataset='seretod'):
     # init logging handler
     cfg.exp_path = 'experiments_retrieve_ebm'
@@ -324,7 +219,7 @@ def train_ebm(cfg, dataset='seretod'):
     model.to(cfg.device[0])
     if cfg.only_one_model:
         save_path = cfg.bert_save_path if dataset=='seretod' else (cfg.bert_save_path+dataset)
-        proposal_model = BertForNextSentencePrediction.from_pretrained(save_path)#EncoderModel(cfg,tokenizer)
+        proposal_model = BertForNextSentencePrediction.from_pretrained(save_path) #EncoderModel(cfg,tokenizer)
         proposal_model.to(cfg.device[-1])
     encoded_data = read_data(tokenizer, ebm=True, dataset=dataset)
     if cfg.debugging:
@@ -508,6 +403,7 @@ def train_ebm(cfg, dataset='seretod'):
                         else:
                             normalize = sum(is_ratio)
                         if normalize>0.0:
+                            # mis sampling
                             if cfg.train_ebm_mis:    
                                 for index, length_i in mis_results.items():
                                     if proposal_wrong_num[index] in statistic:
@@ -517,6 +413,7 @@ def train_ebm(cfg, dataset='seretod'):
                                         statistic[5] += is_logits[index].item()
                                         statistic_count[5] += 1
                                     loss = loss + (length_i*is_logits[index])/normalize
+                            # is sampling
                             else:
                                 for j in range(sample_num):
                                     if proposal_wrong_num[j] in statistic:
@@ -582,249 +479,6 @@ def train_ebm(cfg, dataset='seretod'):
     #score = evaluate(model, test_dataloader, cfg)
     #print(score)
     return
-
-def rescore(proposal_model, model, val_dataloader, hparams, tokenizer, kb_thresh_low=0.0, 
-        kb_thresh_high=1.0): # tokenizer, kb_thresh=30, kb_thresh_prob=0.5
-    origin_threshold = 0.5 # means the sampling probability increased, discard used in sampling
-    accept_threshold = kb_thresh_high # used to simplify computation, accept those triples above the Threshold and ignore them
-    reject_threshold = kb_thresh_low # used to simplify computation, discard those triples above the Threshold and ignore them
-    topk_num = cfg.test_num
-    model.eval()
-    joint_acc = 0
-    joint_acc_e = 0
-    joint_acc_ea = 0
-    total_case = 0
-    joint_acc_a = 0
-    total_case_a = 0
-    total_case_e = 0
-    num_batches = 0
-    global_step = 0
-    tp_a = 0
-    fp_a = 0
-    fn_a = 0
-    tp = 0
-    fp = 0
-    fn = 0
-    labels = []
-    predicts = []
-    with torch.no_grad():
-        for batch in val_dataloader:
-            num_batches += 1
-            global_step += 1
-
-            # Transfer to gpu
-            if torch.cuda.is_available():
-                if cfg.only_one_model:
-                    #logits = proposal_model(input_ids=batch["input"], attention_mask=batch["input_attention"], token_type_ids=batch["input_type"]).logits # ,labels=batch["label"]
-                    #probs = F.softmax(logits, dim=1)
-                    #accs = ((batch["label"]==0)==(probs[:,0]>threshold)).cpu().tolist()
-                    #labels.extend((batch["label"]==0).cpu().tolist())
-                    #predicts.extend((probs[:,0]>threshold).cpu().tolist())
-                    #acc.extend(accs) 
-                    for i in range(len(batch['cases'])): # batch
-                        # get_proposal_prob
-                        p_batch = collate_fn(batch['cases'][i])
-                        for key, val in p_batch.items():
-                            if type(p_batch[key]) is list:
-                                continue
-                            p_batch[key] = p_batch[key].to(cfg.device[-1])
-                        if p_batch!={}:
-                            p_logits = proposal_model(input_ids=p_batch["input"], attention_mask=p_batch["input_attention"], token_type_ids=p_batch["input_type"]).logits
-                            probs = F.softmax(p_logits, dim=1)
-                            accept_prob = probs[:,0].cpu().tolist() # 0 means coherency in bert pretraining
-                        else:
-                            accept_prob = []
-                        #Threshold
-                        triple_num = len(accept_prob)
-                        triples_accepted = []
-                        triples_accepted_idx = []
-                        accepted_probs = 1.0
-                        triples = []
-                        triple_probs = []
-                        triple_idxs = []
-                        proposals = [] # use proposals to indicate the possible results
-                        org_proposals = []
-                        gt = []
-                        accept_result = []
-
-                        # change propose to topk
-                        for num in range(triple_num):
-                            if batch['cases'][i][num]['label'] == 1:
-                                gt.append(num)
-                            if accept_prob[num] > origin_threshold :
-                                accept_result.append(num)
-                            if accept_prob[num]> accept_threshold:
-                                triples_accepted.append(tokenizer.decode(batch['cases'][i][num]['triple']).replace('[CLS]','').replace('[SEP]','')) 
-                                accepted_probs = accepted_probs*accept_prob[num] 
-                                triples_accepted_idx.append(num)
-                            elif accept_prob[num]> reject_threshold:
-                                triples.append(tokenizer.decode(batch['cases'][i][num]['triple']).replace('[CLS]','').replace('[SEP]',''))
-                                triple_probs.append(accept_prob[num])
-                                triple_idxs.append(num)
-                        proposals = [(triples_accepted, accepted_probs, triples_accepted_idx)]
-
-                        # topk_num, get_topk here by using beam search, also somewhat like viterbi algorithm
-                        for t_num in range(len(triples)):
-                            triple = triples[t_num]
-                            triple_prob = triple_probs[t_num]
-                            triple_idx = triple_idxs[t_num]
-                            new_proposals = [] # a temp variable to store the iterated proposal
-                            for proposal in proposals:
-                                new_proposals.append((proposal[0], proposal[1]*(1-triple_prob), proposal[2]))
-                                tmp = copy.deepcopy(proposal)
-                                tmp[0].append(triple)
-                                #tmp[1] = proposal[1]*triple_prob
-                                tmp[2].append(triple_idx)
-                                new_proposals.append((tmp[0], proposal[1]*triple_prob, tmp[2]))
-                            if len(new_proposals)>topk_num:
-                                new_proposals.sort(key=lambda x:x[1], reverse=True)
-                                proposals = copy.deepcopy(new_proposals[:topk_num])
-                            else:
-                                proposals = copy.deepcopy(new_proposals)
-                        proposals.sort(key=lambda x:x[1], reverse=True)
-                        topk = proposals[:topk_num]
-                        #result = sorted(data,key=lambda x:(x[0],x[1].lower()))
-                        # proposals.append('；'.join(proposal))
-                        # proposed_probs.append(math.log(proposed_prob))
-                        #org_proposals.append(org_proposal)
-                        """
-                        proposed_probs = []
-                        for sample_num in range(cfg.train_sample_num): # cfg.test_num
-                            proposal = []
-                            org_proposal = []
-                            gt = []
-                            accept_result = []
-                            random.random()
-                            proposed_prob = 1.0
-                            for num in range(triple_num):
-                                p = random.random()
-                                if p < accept_prob[num] + rescore_threshold:
-                                    proposal.append(tokenizer.decode(batch['cases'][i][num]['triple']).replace('[CLS]','').replace('[SEP]','')) 
-                                    org_proposal.append(num) # num batch['cases'][i][num]
-                                    proposed_prob = proposed_prob*accept_prob[num]
-                                else:
-                                    proposed_prob = proposed_prob*(1-accept_prob[num])
-                                if batch['cases'][i][num]['label'] == 1:
-                                    gt.append(num)
-                                if accept_prob[num] >(0.5 - rescore_threshold) :
-                                    accept_result.append(num)
-                                    # can directly concatenate all the triples to improve efficiency
-                            proposals.append('；'.join(proposal))
-                            proposed_probs.append(math.log(proposed_prob))
-                            org_proposals.append(org_proposal)
-                        """
-                        #if dataset=='seretod':
-                        to_be_reranked = ['；'.join(item[0]) for item in topk]
-                        #else:
-                        #    to_be_reranked = [' '.join(item[0]) for item in topk]
-                        input = get_retrieval_sequence(tokenizer, [batch['context'][i]]*len(topk), to_be_reranked)
-                        input.to(cfg.device[0])
-                        #if cfg.add_extra_feature:
-                        positive_count = torch.tensor([float(len(item[0])) for item in topk], dtype=torch.float).to(cfg.device[0])
-                        if cfg.add_extra_feature:
-                            logits = model(input_ids=input['input_ids'], attention_mask=input["attention_mask"], feature=positive_count).to('cpu').tolist()
-                        else:
-                            logits = model(input_ids=input['input_ids'], attention_mask=input["attention_mask"]).to('cpu').tolist()
-                        if cfg.residual:
-                            for j in range(len(logits)):
-                                logits[j] = logits[j][0] + math.log(topk[j][1])
-                        final = logits.index(max(logits))
-                        triples = proposals[final][2]
-
-                        # compute acc
-                        total_case_e = total_case_e + 1
-                        if gt!=[] and accept_result!=[]:
-                            total_case_a = total_case_a + 1
-                            joint_acc_a += set(accept_result)==set(gt)
-                            joint_acc_ea += set(accept_result)==set(gt)
-                        else:
-                            joint_acc_ea += 1
-                        for num in range(triple_num):
-                            tp_a += (num in accept_result) and (num in gt)
-                            fp_a += (num in accept_result) and (num not in gt)
-                            fn_a += (num not in accept_result) and (num in gt)
-                        if gt!=[] and triples!=[]:
-                            total_case = total_case + 1
-                            joint_acc += set(triples)==set(gt)
-                            joint_acc_e += set(triples)==set(gt)
-                        else:
-                            joint_acc_e += 1
-                        for num in range(triple_num):
-                            tp += (num in triples) and (num in gt)
-                            fp += (num in triples) and (num not in gt)
-                            fn += (num not in triples) and (num in gt)
-                #else:
-                #    _,batch_acc,predict,label = model(input_sent=batch["context"], attention_sent=batch["context_attention"],input_triple=batch["triple"], attention_triple=batch["triple_attention"],label=batch["label"])
-                #    labels.extend(label)
-                #    predicts.extend(predict)
-                #    acc.append(batch_acc)
-    # the positive and negative are assigned to 0 and 1 respectively, so we should calculate the f1 of 0, dealt with by getting the probs of 0
-    recall = tp/(tp+fn)
-    precision= tp/(tp+fp)
-    f1 = 2*precision*recall/(precision + recall+0.000001)
-    recall_a = tp_a/(tp_a+fn_a)
-    precision_a= tp_a/(tp_a+fp_a)
-    f1_a = 2*precision_a*recall_a/(precision_a + recall_a+0.000001)
-    # logging.info
-    print("j_acc with empty slot: energy {}, proposal: {}".format(joint_acc_e/total_case_e, joint_acc_ea/total_case_e))
-    print("proposal result: score: {}, precision: {}, recall: {}, f1: {}".format(joint_acc_a/total_case_a, precision_a, recall_a, f1_a))
-    return joint_acc/total_case, precision, recall, f1
-
-def evaluate(model, val_dataloader, hparams): # tokenizer
-    threshold = 0.1
-    model.eval()
-    acc = []
-    num_batches = 0
-    global_step = 0
-    labels = []
-    predicts = []
-    with torch.no_grad():
-        for batch in val_dataloader:
-            num_batches += 1
-            global_step += 1
-
-            # Transfer to gpu
-            if torch.cuda.is_available():
-                for key, val in batch.items():
-                    if type(batch[key]) is list:
-                        continue
-                    batch[key] = batch[key].to(hparams.device[0])
-                if cfg.only_one_model:
-                    logits = model(input_ids=batch["input"], attention_mask=batch["input_attention"], token_type_ids=batch["input_type"]).logits # ,labels=batch["label"]
-                    probs = F.softmax(logits, dim=1)
-                    accs = ((batch["label"]==0)==(probs[:,0]>threshold)).cpu().tolist()
-                    labels.extend((batch["label"]==0).cpu().tolist())
-                    predicts.extend((probs[:,0]>threshold).cpu().tolist())
-                    acc.extend(accs) 
-                else:
-                    _,batch_acc,predict,label = model(input_sent=batch["context"], attention_sent=batch["context_attention"],input_triple=batch["triple"], attention_triple=batch["triple_attention"],label=batch["label"])
-                    labels.extend(label)
-                    predicts.extend(predict)
-                    acc.append(batch_acc)
-    # the positive and negative are assigned to 0 and 1 respectively, so we should calculate the f1 of 0
-    positive = sum(labels)
-    retrieved = sum((predicts[i] and labels[i]) for i in range(len(predicts)))
-    predicted = sum(predicts)
-    recall = retrieved/positive
-    precision= retrieved/predicted
-    f1 = 2*precision*recall/(precision + recall)
-    return sum(acc)/len(acc), precision, recall, f1
-
-def test(cfg):
-    save_path = cfg.bert_save_path if dataset=='seretod' else (cfg.bert_save_path+dataset)
-    tokenizer = BertTokenizer.from_pretrained(save_path)
-    if cfg.only_one_model:
-        model = BertForNextSentencePrediction.from_pretrained(save_path)#EncoderModel(cfg,tokenizer)
-        model.to(cfg.device[0])
-    else:
-        model = EncoderModel(cfg,tokenizer)
-        model.load_state_dict(torch.load(os.path.join(cfg.retrieval_save_path, "model.pt")))
-
-    encoded_data = read_data(tokenizer, retrieve=True, dataset=dataset)
-    test_dataloader=DataLoader(encoded_data['test'], batch_size=cfg.eval_batch_size, collate_fn=collate_fn)
-    acc, precision, recall, f1 = evaluate(model, test_dataloader, cfg)
-    print("acc: {}, precision: {}, recall: {}, f1: {}".format(acc, precision, recall, f1))
-    return recall
 
 def init_logging_handler(model_name):
     stderr_handler = logging.StreamHandler()
@@ -922,4 +576,4 @@ if __name__ == "__main__":
     if cfg.train_retrieve:
         train(cfg, dataset=dataset)
     if test_retrieve:
-        test(cfg)
+        test(cfg, dataset)
