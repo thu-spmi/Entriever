@@ -9,11 +9,11 @@ pip install -r requirements.txt
 
 Then, unzip the data files:
 ```Shell
-unzip data.zip
 unzip data_e2e.zip
 ```
 ## Data Description
 The data for the MobileCS dataset is under the directory of data/seretod.
+As the access to the data for seretod challenge needs to be authentized by China Mobile, you need to apply for the data usage. More details for the seretod challenge data can be referred to this repo: https://github.com/SereTOD/SereTOD2022. 
 The data for the other 3 datasets is under the directory of data_e2e.
 
 ## Training and Testing
